@@ -1761,6 +1761,13 @@ export function useAgentChat<
 
             if (data.done || data.replayComplete) {
               pendingReplayResumeRequestIdsRef.current.delete(data.id);
+              if (
+                streamStateRef.current.status === "observing" &&
+                streamStateRef.current.streamId === data.id
+              ) {
+                streamStateRef.current = { status: "idle" };
+                setIsServerStreaming(false);
+              }
             }
 
             if (data.done) {
