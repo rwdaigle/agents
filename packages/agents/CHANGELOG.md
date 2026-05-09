@@ -1,5 +1,13 @@
 # @cloudflare/agents
 
+## 0.12.4
+
+### Patch Changes
+
+- [#1376](https://github.com/cloudflare/agents/pull/1376) [`6561a3f`](https://github.com/cloudflare/agents/commit/6561a3fb6ba7e1833c902457a015d47045a4e4a7) Thanks [@hrushikeshdeshpande](https://github.com/hrushikeshdeshpande)! - Avoid throwing when chat stream resume/replay races with a closed WebSocket connection.
+
+- [#1476](https://github.com/cloudflare/agents/pull/1476) [`3c48858`](https://github.com/cloudflare/agents/commit/3c48858d97c09b1dba6879e6689515e8c09a3a93) Thanks [@whoiskatrin](https://github.com/whoiskatrin)! - Fixed a bug that could cause client state to drift from internal Durable Object state when agent tool calls spanned a Durable Object restart.
+
 ## 0.12.3
 
 ### Patch Changes
