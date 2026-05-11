@@ -277,7 +277,21 @@ export function createReadTool(options: ReadToolOptions) {
       return readTextWithLineNumbers({ ops, path, offset, limit });
     },
     toModelOutput: async ({ input, output }) => {
-      if ("error" in output) {
+      // `agents/experimental/memory/utils#truncateOlderMessages` rewrites
+      // older tool-part `output` from a structured object to a string of the
+      // form `"…[truncated N chars]"` once a conversation exceeds
+      // `keepRecent`. Without this guard the `"error" in output` check below
+      // throws `TypeError: Cannot use 'in' operator to search for
+      // 'error' in <string>`, stalling every subsequent inference
+      // attempt. Mirror the AI SDK's default `createToolModelOutput`
+      // fallback by passing a non-object `output` through as a plain text part.
+      if (typeof output !== "object" || output === null) {
+        return {
+          type: "text",
+          value: typeof output === "string" ? output : String(output),
+        };
+      }
+            if ("error" in output) {
         return { type: "error-text", value: output.error };
       }
 
