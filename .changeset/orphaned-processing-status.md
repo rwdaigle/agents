@@ -1,0 +1,5 @@
+---
+"@cloudflare/think": patch
+---
+
+Fix orphaned "processing" status after Durable Object eviction (#1553) across the full crash-reconciliation surface. When a turn was lost between `beforeTurn` and its first recoverable checkpoint, crash reconciliation marked the submission errored but never ran the in-process turn-end hooks, so durable state acquired in `beforeTurn` (and released only in `onChatResponse`/`onChatError`) stayed pinned forever — wedging every queued message behind a turn that ended without ending. Both reconciliation routes now run the same canonical terminal transition a normal turn-end runs (`onChatError` then the response hook with `status: "error"`): the sweep-driven failure path (`_failInterruptedTurn`) and the fiber-recovery continuation path (`_completeRecoveredSubmission`) for any non-`completed` outcome — closing the mid-tool-call eviction case where the continuation early-returns `"skipped"` because no assistant leaf was persisted. Hook firing is deduped per `requestId` so the in-process and reconciliation paths remain at-most-once per turn even when both run for the same request.
