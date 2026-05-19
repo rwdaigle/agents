@@ -21,6 +21,7 @@ export {
   ThinkAsyncHookTestAgent,
   ThinkRecoveryTestAgent,
   ThinkNonRecoveryTestAgent,
+  ThinkOrphanedStatusTestAgent,
   ThinkExtensionHookAgent
 } from "./agents";
 
@@ -43,6 +44,7 @@ import type {
   ThinkAsyncHookTestAgent,
   ThinkRecoveryTestAgent,
   ThinkNonRecoveryTestAgent,
+  ThinkOrphanedStatusTestAgent,
   ThinkExtensionHookAgent
 } from "./agents";
 
@@ -65,6 +67,7 @@ export type Env = {
   ThinkAsyncHookTestAgent: DurableObjectNamespace<ThinkAsyncHookTestAgent>;
   ThinkRecoveryTestAgent: DurableObjectNamespace<ThinkRecoveryTestAgent>;
   ThinkNonRecoveryTestAgent: DurableObjectNamespace<ThinkNonRecoveryTestAgent>;
+  ThinkOrphanedStatusTestAgent: DurableObjectNamespace<ThinkOrphanedStatusTestAgent>;
   ThinkExtensionHookAgent: DurableObjectNamespace<ThinkExtensionHookAgent>;
   LOADER: WorkerLoader;
 };

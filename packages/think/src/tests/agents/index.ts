@@ -16,7 +16,8 @@ export {
   ThinkProgrammaticTestAgent,
   ThinkAsyncHookTestAgent,
   ThinkRecoveryTestAgent,
-  ThinkNonRecoveryTestAgent
+  ThinkNonRecoveryTestAgent,
+  ThinkOrphanedStatusTestAgent
 } from "./think-session";
 export { ThinkFiberTestAgent } from "./fiber";
 export { ThinkClientToolsAgent } from "./client-tools";

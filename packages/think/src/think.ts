@@ -863,6 +863,24 @@ export class Think<
   private _continuationTimer: ReturnType<typeof setTimeout> | null = null;
   private _insideResponseHook = false;
   private _insideInferenceLoop = false;
+  /**
+   * Per-request guard for at-most-once terminal turn-end hook firing.
+   *
+   * `_fireResponseHook` (in-process terminal path) and
+   * `_fireInterruptedTurnHooks` (crash reconciliation path) both end a
+   * turn. Recovery can route the same `requestId` through both — the
+   * continuation re-enters `_streamResult` (which fires the response
+   * hook on its terminal exit) and then `_completeRecoveredSubmission`
+   * runs (which now also fires the interrupted-turn hooks for any
+   * non-`completed` outcome, see `cloudflare/agents#1553`). The set
+   * collapses those into one user-visible turn-end so the standard
+   * acquire-in-`beforeTurn` / release-in-`onChatResponse` pattern stays
+   * exactly-once per turn. Bounded — `requestId`s are single-use UUIDs,
+   * so we cap the set at `FIRED_TERMINAL_HOOKS_CAP` entries and evict
+   * the oldest to keep memory predictable on long-lived DOs.
+   */
+  private _firedTerminalHooks = new Set<string>();
+  private static readonly FIRED_TERMINAL_HOOKS_CAP = 1024;
   private _pendingInteractionPromise: Promise<boolean> | null = null;
   private _submitConcurrency = new SubmitConcurrencyController({
     defaultDebounceMs: Think.MESSAGE_DEBOUNCE_MS
@@ -3059,33 +3077,19 @@ export class Think<
         try {
           appliedState = await this._getSubmissionMessagesAppliedState(row);
         } catch (error) {
-          this.sql`
-            UPDATE cf_think_submissions
-            SET status = 'error',
-                error_message = ${error instanceof Error ? error.message : String(error)},
-                completed_at = ${Date.now()}
-            WHERE submission_id = ${row.submission_id}
-              AND status = 'running'
-          `;
-          const updated = this._readSubmission(row.submission_id);
-          if (updated?.status === "error") {
-            await this._emitSubmissionStatus(updated);
-          }
+          await this._failInterruptedTurn(
+            row,
+            error instanceof Error ? error.message : String(error)
+          );
           continue;
         }
         if (appliedState !== "none") {
-          this.sql`
-            UPDATE cf_think_submissions
-            SET status = 'error',
-                error_message = ${appliedState === "all" ? "Submission was interrupted after messages were applied." : "Submission was interrupted after messages were partially applied."},
-                completed_at = ${Date.now()}
-            WHERE submission_id = ${row.submission_id}
-              AND status = 'running'
-          `;
-          const updated = this._readSubmission(row.submission_id);
-          if (updated?.status === "error") {
-            await this._emitSubmissionStatus(updated);
-          }
+          await this._failInterruptedTurn(
+            row,
+            appliedState === "all"
+              ? "Submission was interrupted after messages were applied."
+              : "Submission was interrupted after messages were partially applied."
+          );
           continue;
         }
         this.sql`
@@ -3111,18 +3115,101 @@ export class Think<
         continue;
       }
 
-      this.sql`
-        UPDATE cf_think_submissions
-        SET status = 'error',
-            error_message = 'Submission was interrupted after messages were applied.',
-            completed_at = ${Date.now()}
-        WHERE submission_id = ${row.submission_id}
-          AND status = 'running'
-      `;
-      const updated = this._readSubmission(row.submission_id);
-      if (updated?.status === "error") {
-        await this._emitSubmissionStatus(updated);
-      }
+      await this._failInterruptedTurn(
+        row,
+        "Submission was interrupted after messages were applied."
+      );
+    }
+  }
+
+  /**
+   * Run the canonical terminal transition for a `running` submission
+   * whose turn was lost when the Durable Object was evicted mid-flight.
+   *
+   * Marks the submission `error`, emits submission status, then fires
+   * the same turn-end lifecycle hooks an in-process error fires (see
+   * the `_streamResult` catch block). Durable Objects provide no crash
+   * callback, so a turn lost between `beforeTurn` and its first
+   * recoverable checkpoint never reaches the in-process terminal path.
+   * Without firing the hooks here, durable state an app acquires in
+   * `beforeTurn` (e.g. `setState({ status: "processing" })`) and
+   * releases in `onChatResponse`/`onChatError` would stay pinned
+   * forever — an orphaned lock that, under `messageConcurrency:
+   * "queue"`, wedges every later message behind a turn that ended
+   * without ending. See cloudflare/agents#1553.
+   */
+  private async _failInterruptedTurn(
+    row: ThinkSubmissionRow,
+    message: string
+  ): Promise<void> {
+    this.sql`
+      UPDATE cf_think_submissions
+      SET status = 'error',
+          error_message = ${message},
+          completed_at = ${Date.now()}
+      WHERE submission_id = ${row.submission_id}
+        AND status = 'running'
+    `;
+    const updated = this._readSubmission(row.submission_id);
+    if (updated?.status !== "error") return;
+    await this._emitSubmissionStatus(updated);
+    await this._fireInterruptedTurnHooks(
+      updated.request_id ?? updated.submission_id,
+      message
+    );
+  }
+
+  /**
+   * Fire the turn-end lifecycle hooks for an interrupted turn, mirroring
+   * the in-process terminal sequence (`onChatError`, then the response
+   * hook with `status: "error"`). This is the "fire the user turn-end
+   * hook" half of crash reconciliation: it gives apps a durable release
+   * path for state acquired in `beforeTurn`, and surfaces the
+   * unanswered turn as a terminal result instead of silently dropping
+   * it.
+   *
+   * Idempotent per `requestId`: if a normal in-process turn-end already
+   * fired the response hook for this request (e.g. the continuation
+   * path re-entered `_streamResult` before reconciliation ran), this
+   * call is a no-op. Bypasses `_fireResponseHook`'s own dedup by
+   * invoking the inner hook directly, since we've already reserved the
+   * slot for both `onChatError` and the response hook.
+   */
+  private async _fireInterruptedTurnHooks(
+    requestId: string,
+    reason: string
+  ): Promise<void> {
+    if (this._firedTerminalHooks.has(requestId)) return;
+    this._markTerminalHookFired(requestId);
+
+    let errorMessage = reason;
+    try {
+      const wrapped = this.onChatError(new Error(reason));
+      errorMessage =
+        wrapped instanceof Error ? wrapped.message : String(wrapped);
+    } catch (error) {
+      console.error(
+        "[Think] onChatError threw during crash reconciliation",
+        error
+      );
+    }
+
+    await this._invokeChatResponseHook({
+      message: { id: crypto.randomUUID(), role: "assistant", parts: [] },
+      requestId,
+      continuation: false,
+      status: "error",
+      error: errorMessage
+    });
+  }
+
+  private _markTerminalHookFired(requestId: string): void {
+    if (this._firedTerminalHooks.has(requestId)) return;
+    this._firedTerminalHooks.add(requestId);
+    const cap = (this.constructor as typeof Think).FIRED_TERMINAL_HOOKS_CAP;
+    if (this._firedTerminalHooks.size > cap) {
+      const oldest = this._firedTerminalHooks.values().next().value;
+      if (oldest !== undefined) this._firedTerminalHooks.delete(oldest);
     }
   }
 
@@ -4606,18 +4693,31 @@ export class Think<
     `;
     const row = rows[0];
     if (!row) return;
-    this.sql`
-      UPDATE cf_think_submissions
-      SET status = 'error',
-          error_message = ${message},
-          completed_at = ${Date.now()}
-      WHERE submission_id = ${row.submission_id}
-        AND status = 'running'
-    `;
-    const updated = this._readSubmission(row.submission_id);
-    if (updated) await this._emitSubmissionStatus(updated);
+    await this._failInterruptedTurn(row, message);
   }
 
+  /**
+   * Terminal transition for a `running` submission that the fiber
+   * recovery path took ownership of and drove through `continueLastTurn`.
+   * Marks the submission with `status`, emits submission status, and —
+   * for any non-`completed` outcome — fires the same turn-end lifecycle
+   * hooks `_failInterruptedTurn` fires, so durable state acquired in
+   * `beforeTurn` gets released on this route too.
+   *
+   * Without this hook-firing parity, a turn evicted mid-tool-call routes
+   * through fiber recovery → `_chatRecoveryContinue` → `continueLastTurn`
+   * → `"skipped"` (no assistant leaf was persisted before the eviction).
+   * The submission reaches a terminal state, but `onChatResponse`/
+   * `onChatError` never run — leaving the `beforeTurn` lock orphaned in
+   * exactly the same shape as the original `cloudflare/agents#1553`.
+   *
+   * `_fireInterruptedTurnHooks` is idempotent per `requestId`, so the
+   * normal-completion case (continuation ran `_streamResult` to
+   * `"completed"`, which already fired the response hook) is naturally
+   * deduped — no `status === "completed"` path reaches the firing
+   * branch here, but the dedup also covers `error`/`aborted` outcomes
+   * where `_streamResult` may have fired before this method ran.
+   */
   private async _completeRecoveredSubmission(
     originalRequestId: string,
     status: ThinkSubmissionStatus,
@@ -4651,8 +4751,14 @@ export class Think<
       LIMIT 1
     `;
     const updated = rows[0];
-    if (updated && this._isTerminalSubmissionStatus(updated.status)) {
-      await this._emitSubmissionStatus(updated);
+    if (!updated || !this._isTerminalSubmissionStatus(updated.status)) return;
+    await this._emitSubmissionStatus(updated);
+
+    if (updated.status !== "completed") {
+      await this._fireInterruptedTurnHooks(
+        updated.request_id ?? updated.submission_id,
+        errorMessage ?? `Recovery ${updated.status}.`
+      );
     }
   }
 
@@ -4924,6 +5030,14 @@ export class Think<
   // ── Response hook ──────────────────────────────────────────────
 
   private async _fireResponseHook(result: ChatResponseResult): Promise<void> {
+    if (this._firedTerminalHooks.has(result.requestId)) return;
+    this._markTerminalHookFired(result.requestId);
+    await this._invokeChatResponseHook(result);
+  }
+
+  private async _invokeChatResponseHook(
+    result: ChatResponseResult
+  ): Promise<void> {
     if (this._insideResponseHook) return;
     this._insideResponseHook = true;
     try {

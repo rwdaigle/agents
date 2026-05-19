@@ -2200,3 +2200,210 @@ export class ThinkNonRecoveryTestAgent extends Think {
     return this._turnCallCount;
   }
 }
+
+// ── ThinkOrphanedStatusTestAgent ────────────────────────────
+// Reproduces cloudflare/agents#1553: the "standard pattern" where a
+// durable `status` is acquired in `beforeTurn` (persisted via
+// `setState()` → SQLite) and released only by the in-process turn-end
+// hooks (`onChatResponse`/`onChatError`). When the DO is evicted
+// mid-flight, the in-process release never runs; crash reconciliation
+// must run the canonical terminal transition so the lock is not
+// orphaned and the unanswered turn is surfaced rather than dropped.
+
+type OrphanedStatusState = { status: "ready" | "processing" };
+
+export class ThinkOrphanedStatusTestAgent extends Think {
+  override chatRecovery = true;
+  override messageConcurrency = "queue" as const;
+  override initialState: OrphanedStatusState = { status: "ready" };
+
+  private _chatErrorLog: string[] = [];
+  private _responseLog: ChatResponseResult[] = [];
+  private _recoveryOverride: ChatRecoveryOptions = {};
+
+  override getModel(): LanguageModel {
+    return createMockModel("Orphaned status response");
+  }
+
+  // Standard pattern: acquire the durable lock when a turn starts.
+  override beforeTurn(_ctx: TurnContext): void {
+    this.setState({ status: "processing" });
+  }
+
+  // Standard pattern: release the durable lock when the turn ends.
+  override onChatResponse(result: ChatResponseResult): void {
+    this._responseLog.push(result);
+    this.setState({ status: "ready" });
+  }
+
+  override onChatError(error: unknown): unknown {
+    this._chatErrorLog.push(
+      error instanceof Error ? error.message : String(error)
+    );
+    this.setState({ status: "ready" });
+    return error;
+  }
+
+  override async onChatRecovery(
+    _ctx: ChatRecoveryContext
+  ): Promise<ChatRecoveryOptions> {
+    return this._recoveryOverride;
+  }
+
+  async getStatusForTest(): Promise<string> {
+    return (this.state as OrphanedStatusState).status;
+  }
+
+  async getChatErrorLogForTest(): Promise<string[]> {
+    return this._chatErrorLog;
+  }
+
+  async getResponseLogForTest(): Promise<ChatResponseResult[]> {
+    return this._responseLog;
+  }
+
+  async setRecoveryOverrideForTest(
+    options: ChatRecoveryOptions
+  ): Promise<void> {
+    this._recoveryOverride = options;
+  }
+
+  async testSubmitMessages(
+    text: string,
+    options?: { submissionId?: string }
+  ): Promise<SubmitMessagesResult> {
+    return this.submitMessages(
+      [
+        {
+          id: crypto.randomUUID(),
+          role: "user" as const,
+          parts: [{ type: "text" as const, text }]
+        }
+      ],
+      options
+    );
+  }
+
+  async inspectSubmissionForTest(
+    submissionId: string
+  ): Promise<ThinkSubmissionInspection | null> {
+    return this.inspectSubmission(submissionId);
+  }
+
+  async recoverSubmissionsForTest(): Promise<void> {
+    await (
+      this as unknown as { _recoverSubmissionsOnStart: () => Promise<void> }
+    )._recoverSubmissionsOnStart();
+  }
+
+  async recoverChatFiberForTest(requestId: string): Promise<void> {
+    await this._handleInternalFiberRecovery({
+      id: `fiber-${requestId}`,
+      name: `${(this.constructor as typeof Think).CHAT_FIBER_NAME}:${requestId}`,
+      snapshot: null,
+      createdAt: Date.now()
+    });
+  }
+
+  async continueRecoveredChatForTest(requestId: string): Promise<void> {
+    await this._chatRecoveryContinue({ recoveredRequestId: requestId });
+  }
+
+  async fireResponseHookForTest(
+    requestId: string,
+    status: "completed" | "error" | "aborted",
+    error?: string
+  ): Promise<void> {
+    await (
+      this as unknown as {
+        _fireResponseHook: (result: ChatResponseResult) => Promise<void>;
+      }
+    )._fireResponseHook({
+      message: { id: crypto.randomUUID(), role: "assistant", parts: [] },
+      requestId,
+      continuation: false,
+      status,
+      error
+    });
+  }
+
+  async fireInterruptedTurnHooksForTest(
+    requestId: string,
+    reason: string
+  ): Promise<void> {
+    await (
+      this as unknown as {
+        _fireInterruptedTurnHooks: (
+          requestId: string,
+          reason: string
+        ) => Promise<void>;
+      }
+    )._fireInterruptedTurnHooks(requestId, reason);
+  }
+
+  /**
+   * Simulate the durable footprint of a turn that was evicted while
+   * suspended on a long async span: the user message was applied, the
+   * submission is still `running`, and the chat fiber row was inserted
+   * by `runFiber` but never deleted (no in-process `finally` ran).
+   */
+  async insertEvictedRunningTurnForTest(options: {
+    submissionId: string;
+    fiberCreatedAt?: number;
+    submissionCreatedAt?: number;
+    withFiber?: boolean;
+  }): Promise<void> {
+    // The durable footprint of a turn evicted after `beforeTurn`: the
+    // app-acquired lock survives in state, the submission is still
+    // `running`, and the chat fiber row was never deleted. The
+    // in-memory liveness gate (which would have cleared it) is gone.
+    this.setState({ status: "processing" });
+    (
+      this as unknown as { _ensureSubmissionTable: () => void }
+    )._ensureSubmissionTable();
+    const now = Date.now();
+    const createdAt = options.submissionCreatedAt ?? now;
+    const messagesJson = JSON.stringify([
+      {
+        id: crypto.randomUUID(),
+        role: "user",
+        parts: [{ type: "text", text: `evicted ${options.submissionId}` }]
+      }
+    ]);
+    this.sql`
+      INSERT INTO cf_think_submissions (
+        submission_id, idempotency_key, request_id, stream_id, status,
+        messages_json, metadata_json, error_message, created_at,
+        messages_applied_at, started_at, completed_at
+      )
+      VALUES (
+        ${options.submissionId}, NULL, ${options.submissionId}, NULL,
+        'running', ${messagesJson}, NULL, NULL, ${createdAt},
+        ${createdAt}, ${createdAt}, NULL
+      )
+    `;
+    if (options.withFiber !== false) {
+      this.sql`
+        INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
+        VALUES (
+          ${`fiber-${options.submissionId}`},
+          ${(this.constructor as typeof Think).CHAT_FIBER_NAME + ":" + options.submissionId},
+          NULL,
+          ${options.fiberCreatedAt ?? createdAt}
+        )
+      `;
+    }
+  }
+
+  async waitForSubmissionStatusForTest(
+    submissionId: string,
+    status: ThinkSubmissionStatus
+  ): Promise<ThinkSubmissionInspection | null> {
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const submission = await this.inspectSubmission(submissionId);
+      if (submission && submission.status === status) return submission;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return this.inspectSubmission(submissionId);
+  }
+}
