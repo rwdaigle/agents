@@ -4697,7 +4697,7 @@ export class Think<
     }
 
     const recoveredRequestId =
-      canContinue && hasRunningSubmission ? requestId : undefined;
+      (canContinue || shouldRetry) && hasRunningSubmission ? requestId : undefined;
 
     if (shouldRetry) {
       await this.schedule(
