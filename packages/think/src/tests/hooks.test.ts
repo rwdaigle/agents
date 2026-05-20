@@ -527,6 +527,16 @@ describe("Think — maxSteps property", () => {
     expect(result.done).toBe(true);
   });
 
+  it("composes TurnConfig stopWhen with the maxSteps bound", async () => {
+    const agent = await freshToolAgent("hook-stop-when-tool-call");
+    await agent.stopAfterEchoToolCall();
+    const result = await agent.testChat("Call echo");
+
+    expect(result.done).toBe(true);
+    expect(await agent.getBeforeStepLog()).toHaveLength(1);
+    expect(await agent.getAfterToolCallLog()).toHaveLength(1);
+  });
+
   it("works with tool-calling loop agent", async () => {
     const agent = await freshLoopToolAgent("hook-loop-ms");
     const messages = agent.getMessages();
@@ -781,6 +791,16 @@ describe("Think — host bridge methods", () => {
     const messages = await agent.hostGetMessages();
     const texts = messages.map((m: { content: string }) => m.content);
     expect(texts).toContain("Injected message");
+
+    const cached = (await agent.getCachedMessagesForTest()) as UIMessage[];
+    const lastCached = cached[cached.length - 1];
+    expect(lastCached.role).toBe("user");
+    expect(lastCached.parts).toEqual([
+      { type: "text", text: "Injected message" }
+    ]);
+
+    const publicMessages = (await agent.getMessages()) as UIMessage[];
+    expect(publicMessages[publicMessages.length - 1]).toEqual(lastCached);
   });
 });
 

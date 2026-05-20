@@ -28,7 +28,7 @@ import type {
 import { parseCronExpression } from "cron-schedule";
 import { nanoid } from "nanoid";
 import { EmailMessage } from "cloudflare:email";
-import { RpcTarget } from "cloudflare:workers";
+import { RpcTarget, exports as workerExports } from "cloudflare:workers";
 import {
   type Connection,
   type ConnectionContext,
@@ -38,7 +38,7 @@ import {
   getServerByName,
   routePartykitRequest
 } from "partyserver";
-import { camelCaseToKebabCase } from "./utils";
+import { camelCaseToKebabCase, isInternalJsStubProp } from "./utils";
 import {
   type RetryOptions,
   tryN,
@@ -265,23 +265,25 @@ export class SqlError extends Error {
 interface FacetCapableCtx {
   facets: DurableObjectFacets;
   /**
-   * Worker exports keyed by class export name. workerd's runtime
-   * contract: any class registered via `migrations.new_sqlite_classes`
-   * (or `migrations.new_classes`) — including facet-only classes
-   * that have NO entry in `durable_objects.bindings` — is exposed
-   * here as BOTH a `DurableObjectClass` (usable as
-   * `FacetStartupOptions.class`) AND a `DurableObjectNamespace`
-   * (usable for `idFromName`/`getByName`). The intersection is what
-   * makes `ctx.exports[OuterSubAgent].idFromName(...)` work from
-   * inside a nested facet bootstrap, even though `OuterSubAgent`
-   * isn't bound. Runtime lookups can still return `undefined` for
-   * unregistered class names; callers must null-check.
+   * Worker exports keyed by class export name. For facet creation, the
+   * runtime only needs the exported Durable Object class. Top-level
+   * Durable Object bindings may also expose namespace helpers here, but
+   * facet-only classes do not need to.
    */
   exports: Record<
     string,
-    (DurableObjectClass & DurableObjectNamespace) | undefined
+    | (DurableObjectClass & Partial<Pick<DurableObjectNamespace, "idFromName">>)
+    | undefined
   >;
 }
+
+type SubAgentPathInvokeEndpoint = {
+  _cf_invokeSubAgentPath(
+    path: ReadonlyArray<{ className: string; name: string }>,
+    method: string,
+    args: unknown[]
+  ): Promise<unknown>;
+};
 
 type SubAgentConnectionMeta = {
   id: string;
@@ -659,10 +661,91 @@ type RootFacetRpcSurface = {
 export type FiberContext = {
   /** Unique identifier for this fiber execution. */
   id: string;
+  /** Cooperative cancellation signal for managed fiber callers. */
+  signal: AbortSignal;
   /** Checkpoint data during execution. Synchronous SQLite write. */
   stash(data: unknown): void;
-  /** Last checkpoint data (null on first run, populated on recovery re-invocation). */
+  /** Currently null during execution; recovered snapshots are passed to onFiberRecovered(). */
   snapshot: unknown | null;
+};
+
+export type FiberStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "aborted"
+  | "interrupted"
+  | "error";
+
+export type StartFiberOptions = {
+  fiberId?: string;
+  idempotencyKey?: string;
+  metadata?: Record<string, unknown>;
+  waitForCompletion?: boolean;
+};
+
+export type FiberInspection = {
+  fiberId: string;
+  name: string;
+  idempotencyKey?: string;
+  status: FiberStatus;
+  snapshot?: unknown;
+  error?: string;
+  metadata?: Record<string, unknown>;
+  createdAt: number;
+  startedAt?: number;
+  settledAt?: number;
+};
+
+export type StartFiberResult = FiberInspection & {
+  accepted: boolean;
+};
+
+export type FiberRecoveryResult =
+  | {
+      status: "completed";
+      snapshot?: unknown;
+      metadata?: Record<string, unknown>;
+    }
+  | {
+      status: "error";
+      error?: unknown;
+      snapshot?: unknown;
+    }
+  | {
+      status: "aborted";
+      reason?: string;
+      snapshot?: unknown;
+    }
+  | {
+      status: "interrupted";
+      reason?: string;
+      snapshot?: unknown;
+    };
+
+export type ListFibersOptions = {
+  status?: FiberStatus | FiberStatus[];
+  name?: string;
+  limit?: number;
+};
+
+export type DeleteFibersOptions = {
+  status?: FiberStatus | FiberStatus[];
+  settledBefore?: Date;
+  limit?: number;
+};
+
+type FiberLedgerRow = {
+  fiber_id: string;
+  idempotency_key: string | null;
+  name: string;
+  status: FiberStatus;
+  snapshot: string | null;
+  metadata_json: string | null;
+  error_message: string | null;
+  created_at: number;
+  started_at: number | null;
+  completed_at: number | null;
 };
 
 /**
@@ -674,6 +757,12 @@ export type FiberRecoveryContext = {
   id: string;
   /** Name passed to `runFiber`. */
   name: string;
+  /** Status for managed fibers recovered through the retained ledger. */
+  status?: FiberStatus;
+  /** Idempotency key for managed fibers, if one was supplied. */
+  idempotencyKey?: string;
+  /** Metadata for managed fibers, if one was supplied. */
+  metadata?: Record<string, unknown> | null;
   /** Last checkpoint data from `stash()`, or null if never stashed. */
   snapshot: unknown | null;
   /**
@@ -686,6 +775,7 @@ export type FiberRecoveryContext = {
 
 const _fiberALS = new AsyncLocalStorage<{
   id: string;
+  signal: AbortSignal;
   stash: (data: unknown) => void;
 }>();
 
@@ -779,7 +869,7 @@ const DEFAULT_KEEP_ALIVE_INTERVAL_MS = 30_000;
  * The constructor stores this as a row in cf_agents_state and checks it
  * on wake to skip DDL on established DOs.
  */
-const CURRENT_SCHEMA_VERSION = 7;
+const CURRENT_SCHEMA_VERSION = 8;
 
 const SCHEMA_VERSION_ROW_ID = "cf_schema_version";
 const STATE_ROW_ID = "cf_state_row_id";
@@ -1173,6 +1263,12 @@ export class Agent<
 
   /** @internal In-memory set of fiber IDs running in this process. */
   private _runFiberActiveFibers = new Set<string>();
+  /** @internal In-memory abort controllers for managed running fibers. */
+  private _managedFiberAbortControllers = new Map<string, AbortController>();
+  /** @internal In-memory executions for callers that want to await accepted work. */
+  private _managedFiberExecutions = new Map<string, Promise<void>>();
+  /** @internal In-memory waiters for managed fibers reaching terminal ledger state. */
+  private _managedFiberTerminalWaiters = new Map<string, Set<() => void>>();
   /** @internal Prevents re-entrant recovery from overlapping alarm ticks. */
   private _runFiberRecoveryInProgress = false;
 
@@ -1577,6 +1673,38 @@ export class Agent<
       this.sql`
         CREATE INDEX IF NOT EXISTS idx_facet_runs_owner_path_key
         ON cf_agents_facet_runs(owner_path_key)
+      `;
+
+      // v8: managed fiber job ledger for idempotent acceptance,
+      // inspection, cancellation, and terminal cleanup.
+      this.sql`
+        CREATE TABLE IF NOT EXISTS cf_agents_fibers (
+          fiber_id TEXT PRIMARY KEY,
+          idempotency_key TEXT UNIQUE,
+          name TEXT NOT NULL,
+          status TEXT NOT NULL,
+          snapshot TEXT,
+          metadata_json TEXT,
+          error_message TEXT,
+          created_at INTEGER NOT NULL,
+          started_at INTEGER,
+          completed_at INTEGER
+        )
+      `;
+
+      this.sql`
+        CREATE INDEX IF NOT EXISTS idx_fibers_status_created
+        ON cf_agents_fibers(status, created_at, fiber_id)
+      `;
+
+      this.sql`
+        CREATE INDEX IF NOT EXISTS idx_fibers_name_status_created
+        ON cf_agents_fibers(name, status, created_at, fiber_id)
+      `;
+
+      this.sql`
+        CREATE INDEX IF NOT EXISTS idx_fibers_status_completed
+        ON cf_agents_fibers(status, completed_at, created_at)
       `;
 
       this.sql`
@@ -4023,6 +4151,473 @@ export class Agent<
     }
   }
 
+  // ── Managed fibers: idempotent durable jobs ────────────────────────
+
+  private _isTerminalFiberStatus(status: FiberStatus): boolean {
+    return (
+      status === "completed" ||
+      status === "aborted" ||
+      status === "interrupted" ||
+      status === "error"
+    );
+  }
+
+  private _notifyManagedFiberTerminal(fiberId: string): void {
+    const row = this._readFiber(fiberId);
+    if (row && !this._isTerminalFiberStatus(row.status)) {
+      return;
+    }
+
+    const waiters = this._managedFiberTerminalWaiters.get(fiberId);
+    if (!waiters) {
+      return;
+    }
+
+    this._managedFiberTerminalWaiters.delete(fiberId);
+    for (const resolve of waiters) {
+      resolve();
+    }
+  }
+
+  private _waitForManagedFiberTerminal(fiberId: string): Promise<void> {
+    const row = this._readFiber(fiberId);
+    if (!row || this._isTerminalFiberStatus(row.status)) {
+      return Promise.resolve();
+    }
+
+    return new Promise<void>((resolve) => {
+      let waiters = this._managedFiberTerminalWaiters.get(fiberId);
+      if (!waiters) {
+        waiters = new Set();
+        this._managedFiberTerminalWaiters.set(fiberId, waiters);
+      }
+      waiters.add(resolve);
+    });
+  }
+
+  private _normalizeFiberStatusFilter(
+    status?: FiberStatus | FiberStatus[]
+  ): Set<FiberStatus> | null {
+    if (!status) return null;
+    return new Set(Array.isArray(status) ? status : [status]);
+  }
+
+  private _parseFiberJsonObject(
+    value: string | null
+  ): Record<string, unknown> | null {
+    if (value === null) return null;
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (
+        parsed !== null &&
+        typeof parsed === "object" &&
+        !Array.isArray(parsed)
+      ) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Invalid metadata should not prevent inspection.
+    }
+    return null;
+  }
+
+  private _parseFiberSnapshot(value: string | null): unknown | undefined {
+    if (value === null) return undefined;
+    try {
+      return JSON.parse(value) as unknown;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private _fiberErrorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  private _stringifyFiberSnapshot(snapshot: unknown): string | null {
+    return snapshot === undefined ? null : JSON.stringify(snapshot);
+  }
+
+  private _fiberRecoveryErrorMessage(
+    result: FiberRecoveryResult
+  ): string | null {
+    if (result.status === "error") {
+      return result.error === undefined
+        ? null
+        : this._fiberErrorMessage(result.error);
+    }
+    if (result.status === "aborted" || result.status === "interrupted") {
+      return result.reason ?? null;
+    }
+    return null;
+  }
+
+  private _applyManagedFiberRecoveryResult(
+    fiberId: string,
+    result: FiberRecoveryResult
+  ): void {
+    const completedAt = Date.now();
+    const snapshot = this._stringifyFiberSnapshot(result.snapshot);
+    const errorMessage = this._fiberRecoveryErrorMessage(result);
+    const metadata =
+      result.status === "completed" && result.metadata !== undefined
+        ? JSON.stringify(result.metadata)
+        : undefined;
+
+    if (metadata !== undefined) {
+      this.sql`
+        UPDATE cf_agents_fibers
+        SET status = ${result.status},
+            snapshot = COALESCE(${snapshot}, snapshot),
+            metadata_json = ${metadata},
+            error_message = ${errorMessage},
+            completed_at = ${completedAt}
+        WHERE fiber_id = ${fiberId}
+          AND status = 'interrupted'
+      `;
+      this._notifyManagedFiberTerminal(fiberId);
+      return;
+    }
+
+    this.sql`
+      UPDATE cf_agents_fibers
+      SET status = ${result.status},
+          snapshot = COALESCE(${snapshot}, snapshot),
+          error_message = ${errorMessage},
+          completed_at = ${completedAt}
+      WHERE fiber_id = ${fiberId}
+        AND status = 'interrupted'
+    `;
+    this._notifyManagedFiberTerminal(fiberId);
+  }
+
+  private _settleManagedFiberExecution(
+    fiberId: string,
+    outcome: { ok: true } | { ok: false; error: unknown },
+    signal: AbortSignal
+  ): void {
+    const completedAt = Date.now();
+    if (outcome.ok) {
+      this.sql`
+        UPDATE cf_agents_fibers
+        SET status = 'completed', completed_at = ${completedAt}
+        WHERE fiber_id = ${fiberId} AND status = 'running'
+      `;
+      this._notifyManagedFiberTerminal(fiberId);
+      return;
+    }
+
+    const message = this._fiberErrorMessage(outcome.error);
+    const status: FiberStatus = signal.aborted ? "aborted" : "error";
+    this.sql`
+      UPDATE cf_agents_fibers
+      SET status = ${status},
+          error_message = ${message},
+          completed_at = ${completedAt}
+      WHERE fiber_id = ${fiberId} AND status = 'running'
+    `;
+    this._notifyManagedFiberTerminal(fiberId);
+  }
+
+  private _parseFiberRecoverySnapshot(
+    fiberId: string,
+    snapshotText: string | null
+  ): unknown | null {
+    if (!snapshotText) return null;
+    try {
+      return JSON.parse(snapshotText) as unknown;
+    } catch {
+      console.warn(
+        `[Agent] Corrupted snapshot for fiber ${fiberId}, treating as null`
+      );
+      return null;
+    }
+  }
+
+  private async _runFiberRecoveryHook(
+    ctx: FiberRecoveryContext,
+    managedRow: FiberLedgerRow | null
+  ): Promise<void> {
+    try {
+      const handled = await this._handleInternalFiberRecovery(ctx);
+      if (!handled) {
+        const recoveryResult = await this.onFiberRecovered(ctx);
+        if (managedRow && recoveryResult) {
+          this._applyManagedFiberRecoveryResult(ctx.id, recoveryResult);
+        }
+      }
+    } catch (e) {
+      if (managedRow) {
+        this.sql`
+          UPDATE cf_agents_fibers
+          SET error_message = ${this._fiberErrorMessage(e)}
+          WHERE fiber_id = ${ctx.id}
+            AND status = 'interrupted'
+        `;
+      }
+      console.error(
+        `[Agent] Fiber recovery failed for "${ctx.name}" (${ctx.id}):`,
+        e
+      );
+    }
+  }
+
+  private _fiberInspectionFromRow(row: FiberLedgerRow): FiberInspection {
+    const snapshot = this._parseFiberSnapshot(row.snapshot);
+    const inspection: FiberInspection = {
+      fiberId: row.fiber_id,
+      name: row.name,
+      status: row.status,
+      createdAt: row.created_at
+    };
+
+    if (row.idempotency_key !== null) {
+      inspection.idempotencyKey = row.idempotency_key;
+    }
+    if (snapshot !== undefined) {
+      inspection.snapshot = snapshot;
+    }
+    if (row.error_message !== null) {
+      inspection.error = row.error_message;
+    }
+    const metadata = this._parseFiberJsonObject(row.metadata_json);
+    if (metadata !== null) {
+      inspection.metadata = metadata;
+    }
+    if (row.started_at !== null) {
+      inspection.startedAt = row.started_at;
+    }
+    if (row.completed_at !== null) {
+      inspection.settledAt = row.completed_at;
+    }
+
+    return inspection;
+  }
+
+  private async _waitForManagedFiber(
+    fiberId: string
+  ): Promise<FiberInspection | null> {
+    const row = this._readFiber(fiberId);
+    if (!row || this._isTerminalFiberStatus(row.status)) {
+      return row ? this._fiberInspectionFromRow(row) : null;
+    }
+
+    if (this._managedFiberExecutions.has(fiberId)) {
+      await this._waitForManagedFiberTerminal(fiberId);
+      return this.inspectFiber(fiberId);
+    }
+
+    await this._checkRunFibers();
+    await this._waitForManagedFiberTerminal(fiberId);
+    return this.inspectFiber(fiberId);
+  }
+
+  private _readFiber(fiberId: string): FiberLedgerRow | null {
+    const rows = this.sql<FiberLedgerRow>`
+      SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+             error_message, created_at, started_at, completed_at
+      FROM cf_agents_fibers
+      WHERE fiber_id = ${fiberId}
+      LIMIT 1
+    `;
+    return rows[0] ?? null;
+  }
+
+  private _readFiberByKey(idempotencyKey: string): FiberLedgerRow | null {
+    const rows = this.sql<FiberLedgerRow>`
+      SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+             error_message, created_at, started_at, completed_at
+      FROM cf_agents_fibers
+      WHERE idempotency_key = ${idempotencyKey}
+      LIMIT 1
+    `;
+    return rows[0] ?? null;
+  }
+
+  private _listFiberRows(options?: ListFibersOptions): FiberLedgerRow[] {
+    const limit = Math.min(Math.max(options?.limit ?? 50, 1), 100);
+    const statuses = this._normalizeFiberStatusFilter(options?.status);
+    if (statuses) {
+      return [...statuses]
+        .flatMap((status) =>
+          this._listFiberRowsByStatus(status, limit, options?.name)
+        )
+        .sort((a, b) =>
+          b.created_at === a.created_at
+            ? b.fiber_id.localeCompare(a.fiber_id)
+            : b.created_at - a.created_at
+        )
+        .slice(0, limit);
+    }
+
+    if (options?.name) {
+      return this.sql<FiberLedgerRow>`
+        SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+               error_message, created_at, started_at, completed_at
+        FROM cf_agents_fibers
+        WHERE name = ${options.name}
+        ORDER BY created_at DESC, fiber_id DESC
+        LIMIT ${limit}
+      `;
+    }
+
+    return this.sql<FiberLedgerRow>`
+      SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+             error_message, created_at, started_at, completed_at
+      FROM cf_agents_fibers
+      ORDER BY created_at DESC, fiber_id DESC
+      LIMIT ${limit}
+    `;
+  }
+
+  private _listFiberRowsByStatus(
+    status: FiberStatus,
+    limit: number,
+    name?: string
+  ): FiberLedgerRow[] {
+    if (name) {
+      return this.sql<FiberLedgerRow>`
+        SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+               error_message, created_at, started_at, completed_at
+        FROM cf_agents_fibers
+        WHERE status = ${status} AND name = ${name}
+        ORDER BY created_at DESC, fiber_id DESC
+        LIMIT ${limit}
+      `;
+    }
+
+    return this.sql<FiberLedgerRow>`
+      SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+             error_message, created_at, started_at, completed_at
+      FROM cf_agents_fibers
+      WHERE status = ${status}
+      ORDER BY created_at DESC, fiber_id DESC
+      LIMIT ${limit}
+    `;
+  }
+
+  async inspectFiber(fiberId: string): Promise<FiberInspection | null> {
+    const row = this._readFiber(fiberId);
+    return row ? this._fiberInspectionFromRow(row) : null;
+  }
+
+  async inspectFiberByKey(
+    idempotencyKey: string
+  ): Promise<FiberInspection | null> {
+    const row = this._readFiberByKey(idempotencyKey);
+    return row ? this._fiberInspectionFromRow(row) : null;
+  }
+
+  async listFibers(options?: ListFibersOptions): Promise<FiberInspection[]> {
+    return this._listFiberRows(options).map((row) =>
+      this._fiberInspectionFromRow(row)
+    );
+  }
+
+  async cancelFiber(fiberId: string, reason?: string): Promise<boolean> {
+    const row = this._readFiber(fiberId);
+    if (!row || this._isTerminalFiberStatus(row.status)) {
+      return false;
+    }
+
+    const now = Date.now();
+    this.sql`
+      UPDATE cf_agents_fibers
+      SET status = 'aborted',
+          error_message = ${reason ?? null},
+          completed_at = ${now}
+      WHERE fiber_id = ${fiberId}
+        AND status IN ('pending', 'running')
+    `;
+    this._managedFiberAbortControllers.get(fiberId)?.abort(reason);
+    this._notifyManagedFiberTerminal(fiberId);
+    return true;
+  }
+
+  async cancelFiberByKey(
+    idempotencyKey: string,
+    reason?: string
+  ): Promise<boolean> {
+    const row = this._readFiberByKey(idempotencyKey);
+    return row ? this.cancelFiber(row.fiber_id, reason) : false;
+  }
+
+  async resolveFiber(
+    fiberId: string,
+    result: FiberRecoveryResult
+  ): Promise<boolean> {
+    const row = this._readFiber(fiberId);
+    if (!row || row.status !== "interrupted") {
+      return false;
+    }
+
+    this._applyManagedFiberRecoveryResult(fiberId, result);
+    return true;
+  }
+
+  async deleteFibers(options?: DeleteFibersOptions): Promise<number> {
+    const statuses =
+      this._normalizeFiberStatusFilter(options?.status) ??
+      new Set<FiberStatus>(["completed", "aborted", "error"]);
+    const terminalStatuses = [...statuses].filter((status) =>
+      this._isTerminalFiberStatus(status)
+    );
+    if (terminalStatuses.length === 0) {
+      return 0;
+    }
+
+    const limit = Math.min(Math.max(options?.limit ?? 100, 1), 500);
+    const settledBefore = options?.settledBefore?.getTime();
+    const rows = terminalStatuses
+      .flatMap((status) =>
+        this._listTerminalFiberRowsForDelete(status, limit, settledBefore)
+      )
+      .sort((a, b) =>
+        a.completed_at === b.completed_at
+          ? a.created_at - b.created_at
+          : (a.completed_at ?? 0) - (b.completed_at ?? 0)
+      )
+      .slice(0, limit);
+
+    for (const row of rows) {
+      this.sql`
+        DELETE FROM cf_agents_fibers
+        WHERE fiber_id = ${row.fiber_id}
+          AND status IN ('completed', 'aborted', 'interrupted', 'error')
+      `;
+    }
+
+    return rows.length;
+  }
+
+  private _listTerminalFiberRowsForDelete(
+    status: FiberStatus,
+    limit: number,
+    settledBefore?: number
+  ): FiberLedgerRow[] {
+    if (settledBefore !== undefined) {
+      return this.sql<FiberLedgerRow>`
+        SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+               error_message, created_at, started_at, completed_at
+        FROM cf_agents_fibers
+        WHERE status = ${status}
+          AND completed_at IS NOT NULL
+          AND completed_at < ${settledBefore}
+        ORDER BY completed_at ASC, created_at ASC
+        LIMIT ${limit}
+      `;
+    }
+
+    return this.sql<FiberLedgerRow>`
+      SELECT fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+             error_message, created_at, started_at, completed_at
+      FROM cf_agents_fibers
+      WHERE status = ${status}
+      ORDER BY completed_at ASC, created_at ASC
+      LIMIT ${limit}
+    `;
+  }
+
   // ── Fibers: durable execution ───────────────────────────────────────
 
   /**
@@ -4042,7 +4637,178 @@ export class Agent<
     name: string,
     fn: (ctx: FiberContext) => Promise<T>
   ): Promise<T> {
-    const id = nanoid();
+    return this._runFiberInternal(nanoid(), name, fn);
+  }
+
+  async startFiber(
+    name: string,
+    fn: (ctx: FiberContext) => Promise<void>,
+    options?: StartFiberOptions
+  ): Promise<StartFiberResult> {
+    const fiberId = options?.fiberId ?? nanoid();
+    const idempotencyKey = options?.idempotencyKey;
+    if (options?.fiberId !== undefined && options.fiberId.trim() === "") {
+      throw new Error("fiberId must not be blank");
+    }
+    if (
+      options?.idempotencyKey !== undefined &&
+      options.idempotencyKey.trim() === ""
+    ) {
+      throw new Error("idempotencyKey must not be blank");
+    }
+    const existingById = this._readFiber(fiberId);
+    const existingByKey = idempotencyKey
+      ? this._readFiberByKey(idempotencyKey)
+      : null;
+
+    if (
+      existingById &&
+      existingByKey &&
+      existingById.fiber_id !== existingByKey.fiber_id
+    ) {
+      throw new Error("fiberId and idempotencyKey refer to different fibers");
+    }
+    if (
+      existingByKey &&
+      options?.fiberId &&
+      existingByKey.fiber_id !== fiberId
+    ) {
+      throw new Error("fiberId and idempotencyKey refer to different fibers");
+    }
+
+    const existing = existingById ?? existingByKey;
+    if (existing) {
+      if (
+        options?.waitForCompletion &&
+        !this._isTerminalFiberStatus(existing.status)
+      ) {
+        const waited = await this._waitForManagedFiber(existing.fiber_id);
+        if (waited) {
+          return {
+            ...waited,
+            accepted: false
+          };
+        }
+        throw new Error(`Fiber ${existing.fiber_id} no longer exists`);
+      }
+      return {
+        ...this._fiberInspectionFromRow(existing),
+        accepted: false
+      };
+    }
+
+    const now = Date.now();
+    this.sql`
+      INSERT INTO cf_agents_fibers
+        (fiber_id, idempotency_key, name, status, snapshot, metadata_json,
+         error_message, created_at, started_at, completed_at)
+      VALUES
+        (${fiberId}, ${idempotencyKey ?? null}, ${name}, 'pending', NULL,
+         ${options?.metadata ? JSON.stringify(options.metadata) : null}, NULL,
+         ${now}, NULL, NULL)
+    `;
+
+    const row = this._readFiber(fiberId);
+    if (!row) {
+      throw new Error(`Failed to create fiber ${fiberId}`);
+    }
+
+    const execution = this._executeManagedFiber(fiberId, name, fn)
+      .catch((error) => {
+        console.error(
+          `[Agent] Managed fiber "${name}" (${fiberId}) failed:`,
+          error
+        );
+      })
+      .finally(() => {
+        if (this._managedFiberExecutions.get(fiberId) === execution) {
+          this._managedFiberExecutions.delete(fiberId);
+        }
+      });
+    this._managedFiberExecutions.set(fiberId, execution);
+
+    if (options?.waitForCompletion) {
+      const completed = await this._waitForManagedFiber(fiberId);
+      if (!completed) {
+        throw new Error(`Fiber ${fiberId} no longer exists`);
+      }
+      return {
+        ...completed,
+        accepted: true
+      };
+    }
+
+    return {
+      ...this._fiberInspectionFromRow(row),
+      accepted: true
+    };
+  }
+
+  private async _executeManagedFiber(
+    fiberId: string,
+    name: string,
+    fn: (ctx: FiberContext) => Promise<void>
+  ): Promise<void> {
+    const row = this._readFiber(fiberId);
+    if (!row || row.status !== "pending") {
+      return;
+    }
+
+    const controller = new AbortController();
+    this._managedFiberAbortControllers.set(fiberId, controller);
+    const now = Date.now();
+    this.sql`
+      UPDATE cf_agents_fibers
+      SET status = 'running', started_at = ${now}
+      WHERE fiber_id = ${fiberId} AND status = 'pending'
+    `;
+
+    const updated = this._readFiber(fiberId);
+    if (!updated || updated.status !== "running") {
+      this._managedFiberAbortControllers.delete(fiberId);
+      return;
+    }
+
+    let settled = false;
+    try {
+      await this._runFiberInternal(fiberId, name, fn, {
+        signal: controller.signal,
+        managed: true,
+        beforeRunCleanup: (outcome) => {
+          settled = true;
+          this._settleManagedFiberExecution(
+            fiberId,
+            outcome,
+            controller.signal
+          );
+        }
+      });
+    } catch (error) {
+      if (!settled) {
+        this._settleManagedFiberExecution(
+          fiberId,
+          { ok: false, error },
+          controller.signal
+        );
+      }
+    } finally {
+      this._managedFiberAbortControllers.delete(fiberId);
+    }
+  }
+
+  private async _runFiberInternal<T>(
+    id: string,
+    name: string,
+    fn: (ctx: FiberContext) => Promise<T>,
+    options?: {
+      signal?: AbortSignal;
+      managed?: boolean;
+      beforeRunCleanup?: (
+        outcome: { ok: true } | { ok: false; error: unknown }
+      ) => void;
+    }
+  ): Promise<T> {
+    const signal = options?.signal ?? new AbortController().signal;
     this.sql`
       INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
       VALUES (${id}, ${name}, NULL, ${Date.now()})
@@ -4061,15 +4827,29 @@ export class Agent<
 
       dispose = await this.keepAlive();
       const stash = (data: unknown) => {
+        const snapshot = JSON.stringify(data);
         this.sql`
-          UPDATE cf_agents_runs SET snapshot = ${JSON.stringify(data)}
+          UPDATE cf_agents_runs SET snapshot = ${snapshot}
           WHERE id = ${id}
         `;
+        if (options?.managed) {
+          this.sql`
+            UPDATE cf_agents_fibers SET snapshot = ${snapshot}
+            WHERE fiber_id = ${id}
+          `;
+        }
       };
 
-      return await _fiberALS.run({ id, stash }, () =>
-        fn({ id, stash, snapshot: null })
-      );
+      try {
+        const result = await _fiberALS.run({ id, signal, stash }, () =>
+          fn({ id, signal, stash, snapshot: null })
+        );
+        options?.beforeRunCleanup?.({ ok: true });
+        return result;
+      } catch (error) {
+        options?.beforeRunCleanup?.({ ok: false, error });
+        throw error;
+      }
     } finally {
       this._runFiberActiveFibers.delete(id);
       this.sql`DELETE FROM cf_agents_runs WHERE id = ${id}`;
@@ -4114,7 +4894,7 @@ export class Agent<
   async onFiberRecovered(
     // oxlint-disable-next-line @typescript-eslint/no-unused-vars -- overridable hook
     _ctx: FiberRecoveryContext
-  ): Promise<void> {
+  ): Promise<void | FiberRecoveryResult> {
     console.warn(
       `[Agent] Fiber "${_ctx.name}" (${_ctx.id}) was interrupted. ` +
         "Override onFiberRecovered to handle recovery."
@@ -4149,17 +4929,7 @@ export class Agent<
       for (const row of rows) {
         if (this._runFiberActiveFibers.has(row.id)) continue;
 
-        let snapshot: unknown = null;
-        if (row.snapshot) {
-          try {
-            snapshot = JSON.parse(row.snapshot);
-          } catch {
-            console.warn(
-              `[Agent] Corrupted snapshot for fiber ${row.id}, treating as null`
-            );
-          }
-        }
-
+        const snapshot = this._parseFiberRecoverySnapshot(row.id, row.snapshot);
         const ctx: FiberRecoveryContext = {
           id: row.id,
           name: row.name,
@@ -4167,19 +4937,74 @@ export class Agent<
           createdAt: row.created_at
         };
 
-        try {
-          const handled = await this._handleInternalFiberRecovery(ctx);
-          if (!handled) {
-            await this.onFiberRecovered(ctx);
+        const managedRow = this._readFiber(row.id);
+        if (managedRow) {
+          if (this._isTerminalFiberStatus(managedRow.status)) {
+            this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+            this._notifyManagedFiberTerminal(row.id);
+            continue;
           }
-        } catch (e) {
-          console.error(
-            `[Agent] Fiber recovery failed for "${ctx.name}" (${ctx.id}):`,
-            e
-          );
+
+          const completedAt = Date.now();
+          this.sql`
+            UPDATE cf_agents_fibers
+            SET status = 'interrupted',
+                snapshot = ${row.snapshot},
+                completed_at = ${completedAt}
+            WHERE fiber_id = ${row.id}
+              AND status IN ('pending', 'running')
+          `;
+          ctx.idempotencyKey = managedRow.idempotency_key ?? undefined;
+          ctx.metadata = this._parseFiberJsonObject(managedRow.metadata_json);
+          ctx.status = "interrupted";
         }
 
+        await this._runFiberRecoveryHook(ctx, managedRow);
         this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+        if (managedRow) {
+          this._notifyManagedFiberTerminal(row.id);
+        }
+      }
+
+      const ledgerOnlyRows = this.sql<FiberLedgerRow>`
+        SELECT f.fiber_id, f.idempotency_key, f.name, f.status, f.snapshot,
+               f.metadata_json, f.error_message, f.created_at, f.started_at,
+               f.completed_at
+        FROM cf_agents_fibers f
+        LEFT JOIN cf_agents_runs r ON r.id = f.fiber_id
+        WHERE f.status IN ('pending', 'running')
+          AND r.id IS NULL
+      `;
+
+      for (const row of ledgerOnlyRows) {
+        if (this._runFiberActiveFibers.has(row.fiber_id)) continue;
+
+        const snapshot = this._parseFiberRecoverySnapshot(
+          row.fiber_id,
+          row.snapshot
+        );
+        const completedAt = Date.now();
+        this.sql`
+          UPDATE cf_agents_fibers
+          SET status = 'interrupted',
+              completed_at = ${completedAt}
+          WHERE fiber_id = ${row.fiber_id}
+            AND status IN ('pending', 'running')
+        `;
+
+        await this._runFiberRecoveryHook(
+          {
+            id: row.fiber_id,
+            name: row.name,
+            snapshot,
+            createdAt: row.created_at,
+            idempotencyKey: row.idempotency_key ?? undefined,
+            metadata: this._parseFiberJsonObject(row.metadata_json),
+            status: "interrupted"
+          },
+          row
+        );
+        this._notifyManagedFiberTerminal(row.fiber_id);
       }
     } finally {
       this._runFiberRecoveryInProgress = false;
@@ -5513,6 +6338,64 @@ export class Agent<
     args: unknown[]
   ): Promise<unknown> {
     const stub = await this._cf_resolveSubAgent(className, name);
+    return await this._cf_invokeStubMethod(stub, className, method, args);
+  }
+
+  /**
+   * Bridge method used by `parentAgent()` when the requested parent is
+   * itself a facet (and therefore has no top-level env namespace).
+   * The root receives the full root-first target path, then each hop
+   * delegates to the next facet using that facet's own `ctx.facets`.
+   *
+   * @internal
+   */
+  async _cf_invokeSubAgentPath(
+    path: ReadonlyArray<{ className: string; name: string }>,
+    method: string,
+    args: unknown[]
+  ): Promise<unknown> {
+    const [self, next, ...rest] = path;
+    if (!self) {
+      throw new Error(`Sub-agent path invocation requires a non-empty path.`);
+    }
+
+    const ownClassName = (this.constructor as { name: string }).name;
+    if (self.className !== ownClassName || self.name !== this.name) {
+      throw new Error(
+        `Sub-agent path invocation reached ${ownClassName}("${this.name}") ` +
+          `but expected ${self.className}("${self.name}").`
+      );
+    }
+
+    if (!next) {
+      return await this._cf_invokeStubMethod(
+        this,
+        this.constructor.name,
+        method,
+        args
+      );
+    }
+
+    const child = await this._cf_resolveSubAgent(next.className, next.name);
+    if (rest.length === 0) {
+      return await this._cf_invokeStubMethod(
+        child,
+        next.className,
+        method,
+        args
+      );
+    }
+
+    const bridge = child as SubAgentPathInvokeEndpoint;
+    return await bridge._cf_invokeSubAgentPath([next, ...rest], method, args);
+  }
+
+  private async _cf_invokeStubMethod(
+    stub: unknown,
+    className: string,
+    method: string,
+    args: unknown[]
+  ): Promise<unknown> {
     // Must call `handle[method](...)` in one expression — extracting
     // via `const fn = handle[method]; fn.apply(handle, args)` breaks
     // the workerd RpcProperty binding. (Confirmed by the spike.)
@@ -5548,11 +6431,11 @@ export class Agent<
    *
    * The facet's name (and `this.name` getter) is handled entirely by
    * partyserver via `ctx.id.name`, which is populated because the
-   * parent passed an explicit `id: parentNs.idFromName(name)` to
+   * parent passed an explicit named Durable Object id to
    * `ctx.facets.get()` — see {@link _cf_resolveSubAgent}. No
    * `setName()` call or `__ps_name` storage write is needed; the
-   * facet's name survives cold wake automatically because the
-   * factory re-runs and `idFromName` is deterministic.
+   * facet's name survives cold wake automatically because the factory
+   * re-runs and `idFromName` is deterministic.
    *
    * @internal Called by {@link subAgent}.
    */
@@ -5561,9 +6444,9 @@ export class Agent<
     parentPath: ReadonlyArray<{ className: string; name: string }> = []
   ): Promise<void> {
     // Defense in depth: the parent is supposed to construct the
-    // facet with `id: parentNs.idFromName(name)` via
-    // `_cf_resolveSubAgent`, which makes `this.name` resolve to
-    // `name` automatically through partyserver's `ctx.id.name`. If
+    // facet with a named Durable Object id via `_cf_resolveSubAgent`,
+    // which makes `this.name` resolve to `name` automatically
+    // through partyserver's `ctx.id.name`. If
     // it didn't (e.g. someone bypassed `_cf_resolveSubAgent`, or
     // the parent's id construction has a bug), `this.name` would
     // silently report the parent's name instead of the facet's
@@ -5631,26 +6514,33 @@ export class Agent<
   }
 
   /**
-   * Resolve a typed RPC stub for this facet's **immediate** parent
+   * Resolve a typed parent stub for this facet's **immediate** parent
    * agent.
    *
    * Symmetric with `subAgent(Cls, name)`: while `subAgent` opens a
    * stub from parent to child, `parentAgent` opens one from child
    * to parent. Pass the direct parent's class reference — the
    * framework verifies it matches the last entry of
-   * `this.parentPath` at runtime, then looks up `env[Cls.name]` to
-   * find the namespace binding.
+   * `this.parentPath` at runtime. If the parent is a top-level
+   * Durable Object, the framework returns the normal namespace stub.
+   * If the parent is itself a facet, the framework returns a bridge
+   * proxy that routes method calls through the root/supervisor and
+   * then down the recorded facet path.
    *
    * `this.parentPath` is root-first, so the direct parent is the
    * **last** entry: `this.parentPath.at(-1)`. For grandparents and
    * further ancestors, iterate `this.parentPath` and use
    * `getAgentByName(env.X, this.parentPath[i].name)` directly.
    *
-   * Assumes the standard "binding name matches class name" convention.
-   * If your `wrangler.jsonc` binds the parent under a different name
-   * (e.g. `{ class_name: "Inbox", name: "MY_INBOX" }`), call
-   * `getAgentByName(env.MY_INBOX, this.parentPath.at(-1)!.name)`
-   * directly instead.
+   * For top-level parents, the framework first checks `env[Cls.name]`,
+   * then falls back to the Worker `exports` object. This supports
+   * custom binding names as long as the parent class is exported under
+   * its class name.
+   *
+   * Facet-parent stubs route normal HTTP `.fetch()` calls through the
+   * same root bridge as RPC methods. WebSocket upgrade requests are
+   * not supported yet because WebSocket handles cannot be serialized
+   * over RPC.
    *
    * @experimental The API surface may change before stabilizing.
    *
@@ -5658,7 +6548,8 @@ export class Agent<
    * @throws If `Cls.name` doesn't match the recorded direct-parent
    *         class (guards against accidentally reaching the wrong
    *         DO, especially in nested Root → Mid → Leaf chains).
-   * @throws If no env binding named `Cls.name` is found.
+   * @throws If no namespace is found for a top-level parent, or no
+   *         root namespace is available for a facet parent bridge.
    *
    * @example
    * ```ts
@@ -5693,18 +6584,115 @@ export class Agent<
           `whose constructor actually spawned this facet.`
       );
     }
-    const binding = (this.env as Record<string, unknown>)[cls.name] as
-      | DurableObjectNamespace<T>
-      | undefined;
+    if (this._parentPath.length > 1) {
+      return await this._cf_parentAgentFacetProxy<T>(
+        cls.name,
+        this._parentPath
+      );
+    }
+
+    const binding = this._cf_getTopLevelNamespaceByClassName<T>(cls.name);
     if (!binding) {
       throw new Error(
-        `parentAgent(${cls.name}): no top-level binding "${cls.name}" ` +
-          `found in env. If the parent is bound under a different name ` +
-          `(e.g. "MY_${cls.name.toUpperCase()}"), use ` +
-          `\`getAgentByName(env.MY_${cls.name.toUpperCase()}, this.parentPath.at(-1)!.name)\` directly.`
+        `parentAgent(${cls.name}): no top-level namespace for "${cls.name}" ` +
+          `was found in env or worker exports. Make sure the parent class is ` +
+          `exported under that class name and registered as a Durable Object binding.`
       );
     }
     return await getServerByName<Cloudflare.Env, T>(binding, parent.name);
+  }
+
+  private _cf_getTopLevelNamespaceByClassName<T extends Agent>(
+    className: string
+  ): DurableObjectNamespace<T> | undefined {
+    // Prefer explicit env bindings; fall back to worker exports so
+    // custom binding names still work when the class is exported under
+    // its constructor name.
+    return (
+      this._cf_asDurableObjectNamespace<T>(
+        (this.env as Record<string, unknown>)[className]
+      ) ??
+      this._cf_asDurableObjectNamespace<T>(
+        (workerExports as Record<string, unknown>)[className]
+      )
+    );
+  }
+
+  private _cf_asDurableObjectNamespace<T extends Agent>(
+    candidate: unknown
+  ): DurableObjectNamespace<T> | undefined {
+    const binding = candidate as DurableObjectNamespace<T> | undefined;
+    return binding?.idFromName ? binding : undefined;
+  }
+
+  private async _cf_parentAgentFacetProxy<T extends Agent>(
+    className: string,
+    parentPath: ReadonlyArray<{ className: string; name: string }>
+  ): Promise<DurableObjectStub<T>> {
+    const [root] = parentPath;
+    if (!root) {
+      throw new Error(`parentAgent(${className}): parent path is empty.`);
+    }
+
+    const rootBinding = this._cf_getTopLevelNamespaceByClassName<Agent>(
+      root.className
+    );
+    if (!rootBinding) {
+      throw new Error(
+        `parentAgent(${className}): direct parent is a facet, but no ` +
+          `top-level root namespace "${root.className}" was found in env ` +
+          `or worker exports to bridge the call.`
+      );
+    }
+
+    const rootStubPromise = getServerByName<Cloudflare.Env, Agent>(
+      rootBinding,
+      root.name
+    );
+    const targetPath = parentPath.map((step) => ({ ...step }));
+    const invokeBridge = async (method: string, args: unknown[]) => {
+      const rootStub = await rootStubPromise;
+      const bridge = rootStub as unknown as SubAgentPathInvokeEndpoint;
+      return await bridge._cf_invokeSubAgentPath(targetPath, method, args);
+    };
+    const owner = this;
+    return new Proxy(
+      {},
+      {
+        get(_target, prop) {
+          if (isInternalJsStubProp(prop)) return undefined;
+          if (typeof prop !== "string") return undefined;
+          if (prop === "fetch") {
+            return async (input: RequestInfo | URL, init?: RequestInit) => {
+              if (owner._cf_isWebSocketUpgradeRequest(input, init)) {
+                throw new Error(
+                  `parentAgent(${className}).fetch() does not support WebSocket upgrade requests yet. ` +
+                    `Use externally routed sub-agent URLs for WebSocket connections.`
+                );
+              }
+
+              return await invokeBridge(prop, [input, init]);
+            };
+          }
+          return async (...args: unknown[]) => {
+            return await invokeBridge(prop, args);
+          };
+        }
+      }
+    ) as DurableObjectStub<T>;
+  }
+
+  private _cf_isWebSocketUpgradeRequest(
+    input: RequestInfo | URL,
+    init?: RequestInit
+  ): boolean {
+    const initHeaders = init?.headers ? new Headers(init.headers) : undefined;
+    const requestHeaders =
+      input instanceof Request ? new Headers(input.headers) : undefined;
+    return (
+      initHeaders?.get("Upgrade")?.toLowerCase() === "websocket" ||
+      requestHeaders?.get("Upgrade")?.toLowerCase() === "websocket"
+    );
   }
 
   /**
@@ -6672,23 +7660,23 @@ export class Agent<
     // Composite key: class name + NUL + facet name, so two different
     // classes can share the same user-facing name.
     const facetKey = `${className}\0${name}`;
-    // Pass an explicit `id` in FacetStartupOptions so the facet has
-    // its own `ctx.id.name === name` (not the parent's name).
-    // Without this, facets inherit the parent DO's `ctx.id` and
-    // `this.name` on the facet would silently return the parent's
-    // name. See:
+    // Pass an explicit named `id` in FacetStartupOptions so the
+    // facet has its own `ctx.id.name === name` (not the parent's
+    // name). Without this, facets inherit the parent DO's `ctx.id`
+    // and `this.name` on the facet would silently return the
+    // parent's name. See:
     // https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/
     //
-    // The id is constructed from the parent's own bound namespace,
-    // which is always present in `ctx.exports` because the parent
-    // Agent class is bound as a DO. Any bound DurableObjectNamespace
-    // would work — the id is opaque + a name; nothing routes
-    // through the namespace at runtime for facets. We use the
-    // parent's because it's guaranteed available without extra
-    // env-binding lookups.
-    const parentClassName = (this.constructor as { name: string }).name;
-    const parentNs = ctx.exports[parentClassName];
-    if (!parentNs?.idFromName) {
+    // For nested facets, the immediate parent is itself facet-only
+    // and is not expected to expose namespace helpers. Use the root
+    // supervisor namespace instead; the id is opaque for facet
+    // routing, but `idFromName(name)` gives PartyServer a stable
+    // `ctx.id.name`.
+    const rootClassName =
+      this._parentPath[0]?.className ??
+      (this.constructor as { name: string }).name;
+    const rootNs = ctx.exports[rootClassName];
+    if (!rootNs?.idFromName) {
       // Minification is the most common cause of this error in
       // production builds: aggressive bundlers rewrite class
       // identifiers to short ids, so `this.constructor.name`
@@ -6701,15 +7689,15 @@ export class Agent<
       // `_a`, `_ab`, `_a1`, `__a`). Real class names like
       // `MyAgent` or `_UnboundParent` start with an uppercase
       // letter and won't match.
-      const looksMinified = /^_*[a-z][a-z0-9]{0,2}$/.test(parentClassName);
+      const looksMinified = /^_*[a-z][a-z0-9]{0,2}$/.test(rootClassName);
       const minificationHint = looksMinified
-        ? ` The class name "${parentClassName}" looks minified — make sure your bundler preserves class names (e.g. esbuild's \`keepNames: true\`).`
+        ? ` The class name "${rootClassName}" looks minified — make sure your bundler preserves class names (e.g. esbuild's \`keepNames: true\`).`
         : "";
       throw new Error(
-        `Sub-agent bootstrap requires the parent class "${parentClassName}" to be bound as a Durable Object namespace, but ctx.exports["${parentClassName}"] is missing or doesn't expose idFromName.${minificationHint} Make sure the parent agent class is registered in your wrangler.jsonc durable_objects.bindings under its class name.`
+        `Sub-agent bootstrap requires the root agent class "${rootClassName}" to be available as a Durable Object namespace, but ctx.exports["${rootClassName}"] is missing or doesn't expose idFromName.${minificationHint} Make sure the root agent class is exported under that class name and registered in your wrangler.jsonc durable_objects.bindings.`
       );
     }
-    const facetId = parentNs.idFromName(name);
+    const facetId = rootNs.idFromName(name);
     const stub = ctx.facets.get(facetKey, () => ({
       class: Cls as DurableObjectClass,
       id: facetId
@@ -6980,6 +7968,7 @@ export class Agent<
     this.sql`DROP TABLE IF EXISTS cf_agents_workflows`;
     this.sql`DROP TABLE IF EXISTS cf_agents_sub_agents`;
     this.sql`DROP TABLE IF EXISTS cf_agents_runs`;
+    this.sql`DROP TABLE IF EXISTS cf_agents_fibers`;
     this.sql`DROP TABLE IF EXISTS cf_agents_facet_runs`;
     this.sql`DROP TABLE IF EXISTS cf_agent_tool_runs`;
   }

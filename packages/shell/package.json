@@ -1,6 +1,6 @@
 {
   "name": "@cloudflare/shell",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Experimental sandboxed JS execution and filesystem runtime for Cloudflare Workers agents",
   "repository": {
     "directory": "packages/shell",
@@ -12,10 +12,10 @@
   },
   "dependencies": {
     "@cloudflare/codemode": "*",
-    "isomorphic-git": "^1.37.6"
+    "isomorphic-git": "^1.38.1"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.16.4",
+    "@cloudflare/vitest-pool-workers": "^0.16.7",
     "vitest": "4.1.6"
   },
   "types": "dist/index.d.ts",

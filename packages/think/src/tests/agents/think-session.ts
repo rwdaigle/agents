@@ -1,5 +1,5 @@
 import type { LanguageModel, UIMessage } from "ai";
-import { Output, tool } from "ai";
+import { hasToolCall, Output, tool } from "ai";
 import { Think } from "../../think";
 import type {
   StreamCallback,
@@ -283,6 +283,11 @@ class TestCollectingCallback implements StreamCallback {
   events: string[] = [];
   doneCalled = false;
   errorMessage?: string;
+  requestId?: string;
+
+  onStart(event: { requestId: string }): void {
+    this.requestId = event.requestId;
+  }
 
   onEvent(json: string): void {
     this.events.push(json);
@@ -696,6 +701,37 @@ export class ThinkTestAgent extends Think {
     return { events, done: doneCalled, doneCalled };
   }
 
+  async testChatWithCancelChat(
+    message: string,
+    cancelAfterEvents: number
+  ): Promise<TestChatResult & { doneCalled: boolean; requestId?: string }> {
+    const events: string[] = [];
+    let doneCalled = false;
+    let requestId: string | undefined;
+
+    const cb: StreamCallback = {
+      onStart(event) {
+        requestId = event.requestId;
+      },
+      onEvent: async (json: string) => {
+        events.push(json);
+        if (requestId && events.length >= cancelAfterEvents) {
+          await this.cancelChat(requestId, "test cancel");
+        }
+      },
+      onDone() {
+        doneCalled = true;
+      },
+      onError(error: string) {
+        events.push(`ERROR:${error}`);
+      }
+    };
+
+    await this.chat(message, cb);
+
+    return { events, done: doneCalled, doneCalled, requestId };
+  }
+
   async setResponse(response: string): Promise<void> {
     this._response = response;
   }
@@ -755,6 +791,50 @@ export class ThinkTestAgent extends Think {
 
   async getStoredMessages(): Promise<UIMessage[]> {
     return this.getMessages();
+  }
+
+  async getCachedMessagesForTest(): Promise<UIMessage[]> {
+    return this.messages;
+  }
+
+  async getSessionHistoryForTest(): Promise<UIMessage[]> {
+    return (await this.session.getHistory()) as UIMessage[];
+  }
+
+  async enableCompactionForTest(): Promise<void> {
+    this.session
+      .onCompaction(async (messages) => {
+        if (messages.length < 2) return null;
+        return {
+          summary: "compacted-summary",
+          fromMessageId: messages[0].id,
+          toMessageId: messages[messages.length - 1].id
+        };
+      })
+      .compactAfter(1);
+  }
+
+  async mutatingGetMessagesResultChangesCacheForTest(): Promise<boolean> {
+    const before = (await this.getMessages()).length;
+    const messages = await this.getMessages();
+    messages.push({
+      id: "mutated-outside-cache",
+      role: "user",
+      parts: [{ type: "text", text: "mutated" }]
+    });
+    return (await this.getMessages()).length !== before;
+  }
+
+  async appendHistoryMessageForTest(msg: UIMessage): Promise<void> {
+    await this.appendMessageToHistory(msg);
+  }
+
+  async appendSessionMessageForTest(msg: UIMessage): Promise<void> {
+    await this.session.appendMessage(msg);
+  }
+
+  async updateSessionMessageForTest(msg: UIMessage): Promise<void> {
+    await this.session.updateMessage(msg);
   }
 
   async getResponseLog(): Promise<ChatResponseResult[]> {
@@ -1269,6 +1349,18 @@ export class ThinkToolsTestAgent extends Think {
     this._echoExecuteMode = mode;
   }
 
+  async stopAfterEchoToolCall(): Promise<void> {
+    this._turnStopCondition = hasToolCall("echo");
+  }
+
+  private _turnStopCondition: TurnConfig["stopWhen"];
+
+  override beforeTurn(): TurnConfig | void {
+    if (this._turnStopCondition) {
+      return { stopWhen: this._turnStopCondition };
+    }
+  }
+
   private _beforeToolCallThrowMessage: string | null = null;
   private _beforeToolCallAsync = false;
 
@@ -1778,7 +1870,7 @@ export class ThinkProgrammaticTestAgent extends Think {
         : null;
     return {
       result,
-      persistedMessageCount: this.getMessages().length,
+      persistedMessageCount: (await this.getMessages()).length,
       lastResponseStatus: lastResponse?.status ?? null
     };
   }

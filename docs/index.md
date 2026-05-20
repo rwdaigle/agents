@@ -34,7 +34,7 @@
 - [Queue](./queue.md) - Immediate background task execution
 - [Scheduling](./scheduling.md) - Delayed, scheduled, and cron-based tasks
 - [Retries](./retries.md) - Automatic retries with exponential backoff and jitter
-- [Durable Execution](./durable-execution.md) - `runFiber()`, `stash()`, and crash recovery for long tasks
+- [Durable Execution](./durable-execution.md) - `runFiber()`, `startFiber()`, `stash()`, and crash recovery for long tasks
 - [Workflows](./workflows.md) - Durable multi-step processing with Cloudflare Workflows
 - [Human in the Loop](./human-in-the-loop.md) - Approval flows and manual intervention
 
@@ -61,6 +61,7 @@
 - [Tools](./think/tools.md) - Workspace tools, code execution, extensions
 - [Client Tools](./think/client-tools.md) - Browser-side tools, approvals, and concurrency
 - [Sub-agents and Programmatic Turns](./think/sub-agents.md) - RPC streaming, `saveMessages`, recovery
+- [Programmatic Submissions](./think/programmatic-submissions.md) - Durable Think turn admission for webhooks and RPC callers
 
 ## MCP (Model Context Protocol)
 

@@ -165,31 +165,28 @@ describe("SubAgent", () => {
     expect(error).toMatch(/not found in worker exports/);
   });
 
-  it("should throw descriptive error when the parent class is exported under a different name than its declaration", async () => {
-    // The parent's class identifier is `_UnboundParent` but it's
-    // exported as `TestUnboundParentAgent`. So `this.constructor.name`
-    // inside an instance is `_UnboundParent`, but `ctx.exports` is
-    // keyed by the export name (`TestUnboundParentAgent`). The
-    // ctx.exports[parentClassName] lookup fails, and we expect a
-    // helpful error pointing at the binding requirement.
+  it("should throw descriptive error when the root class is exported under a different name than its declaration", async () => {
+    // Top-level roots still need a namespace for named facet IDs. If
+    // the root class identifier and export/binding name differ, the
+    // framework cannot find that namespace by constructor name.
     const parentName = uniqueName();
     const childName = uniqueName();
     const agent = await getAgentByName(env.TestUnboundParentAgent, parentName);
 
     const error = await agent.tryToSpawn(childName);
     expect(error).toMatch(
-      /Sub-agent bootstrap requires the parent class "_UnboundParent" to be bound/
+      /Sub-agent bootstrap requires the root agent class "_UnboundParent" to be available/
     );
     expect(error).toMatch(/wrangler\.jsonc durable_objects\.bindings/);
     // Class identifier doesn't look minified — no minification hint.
     expect(error).not.toMatch(/looks minified/);
   });
 
-  it("should hint at minification when the parent class name looks minified", async () => {
-    // Same scenario, but the parent's class identifier is `_a` —
-    // matches the minification heuristic. The error message should
-    // include the bundler hint so users with minified production
-    // builds get a helpful pointer.
+  it("should hint at minification when the root class name looks minified", async () => {
+    // Same scenario, but the root class identifier is `_a` — matches
+    // the minification heuristic. The error message should include
+    // the bundler hint so users with minified production builds get a
+    // helpful pointer.
     const parentName = uniqueName();
     const childName = uniqueName();
     const agent = await getAgentByName(
@@ -198,7 +195,7 @@ describe("SubAgent", () => {
     );
 
     const error = await agent.tryToSpawn(childName);
-    expect(error).toMatch(/parent class "_a" to be bound/);
+    expect(error).toMatch(/root agent class "_a" to be available/);
     expect(error).toMatch(/looks minified/);
     expect(error).toMatch(/keepNames/);
   });
@@ -342,6 +339,18 @@ describe("SubAgent", () => {
 
       const result = await agent.nestedPing("outer-1");
       expect(result).toBe("outer-pong");
+    });
+
+    it("should not require the immediate facet parent to expose namespace helpers", async () => {
+      const name = uniqueName();
+      const agent = await getAgentByName(env.TestSubAgentParent, name);
+
+      const error = await agent.nestedSpawnWithFacetParentNamespaceHidden(
+        "outer-1",
+        "inner-1"
+      );
+
+      expect(error).toBe("");
     });
   });
 
@@ -958,7 +967,7 @@ describe("SubAgent", () => {
 
     const fiberId = await agent.subAgentHoldFiber("fiber-child", "held");
 
-    expect(await agent.getRootKeepAliveRefCount()).toBe(1);
+    await expectRootKeepAliveRefCount(agent, 1);
     expect(await agent.subAgentRunningFiberCount("fiber-child")).toBe(1);
     expect((await agent.facetRunRows()).map((row) => row.runId)).toContain(
       fiberId
@@ -977,6 +986,41 @@ describe("SubAgent", () => {
     expect(await agent.subAgentRunningFiberCount("fiber-child")).toBe(0);
     expect(await agent.facetRunRows()).toEqual([]);
     await expectRootKeepAliveRefCount(agent, 0);
+  });
+
+  it("holds root keepAlive and facet-run leases for managed sub-agent fibers", async () => {
+    const name = uniqueName();
+    const agent = await getAgentByName(env.TestSubAgentParent, name);
+
+    const fiberId = await agent.subAgentHoldManagedFiber(
+      "managed-fiber-child",
+      "held-managed",
+      "managed-key"
+    );
+
+    await expectRootKeepAliveRefCount(agent, 1);
+    expect(await agent.subAgentRunningFiberCount("managed-fiber-child")).toBe(
+      1
+    );
+    expect((await agent.facetRunRows()).map((row) => row.runId)).toContain(
+      fiberId
+    );
+    await expect(
+      agent.subAgentManagedFiber("managed-fiber-child", fiberId)
+    ).resolves.toMatchObject({
+      fiberId,
+      status: "running",
+      idempotencyKey: "managed-key"
+    });
+
+    await agent.subAgentReleaseHeldFiber("managed-fiber-child");
+    await expectRootKeepAliveRefCount(agent, 0);
+    await expect(
+      agent.subAgentManagedFiber("managed-fiber-child", fiberId)
+    ).resolves.toMatchObject({
+      fiberId,
+      status: "completed"
+    });
   });
 
   it("recovers an interrupted sub-agent fiber from the root alarm", async () => {
@@ -1004,6 +1048,31 @@ describe("SubAgent", () => {
         snapshot: { value: "checkpoint" }
       })
     ]);
+  });
+
+  it("applies managed sub-agent fiber recovery outcomes from the child", async () => {
+    const name = uniqueName();
+    const agent = await getAgentByName(env.TestSubAgentParent, name);
+
+    await agent.insertSubAgentInterruptedManagedFiber(
+      "managed-recover-child",
+      "managed-fiber-recover-1",
+      "managed-recovery-complete",
+      { value: "checkpoint" }
+    );
+
+    await runDurableObjectAlarm(agent);
+
+    await expect(
+      agent.subAgentManagedFiber(
+        "managed-recover-child",
+        "managed-fiber-recover-1"
+      )
+    ).resolves.toMatchObject({
+      status: "completed",
+      snapshot: { recovered: true }
+    });
+    expect(await agent.facetRunRows()).toEqual([]);
   });
 
   it("lets internal sub-agent fiber recovery schedule continuation work in the child", async () => {
@@ -1110,6 +1179,23 @@ describe("SubAgent", () => {
       expect(observed).toBe(parentName);
     });
 
+    it("resolves a top-level parent whose binding name differs from the class name", async () => {
+      const parentName = uniqueName();
+      const parent = await getAgentByName(
+        env.CUSTOM_BOUND_SUB_AGENT_PARENT,
+        parentName
+      );
+
+      // `CustomBoundSubAgentParent` is registered under the
+      // `CUSTOM_BOUND_SUB_AGENT_PARENT` binding, so `env[Cls.name]`
+      // is absent. `parentAgent(CustomBoundSubAgentParent)` should
+      // still resolve via the worker `exports` namespace.
+      const observed = await parent.subAgentCallParentName(
+        "custom-binding-parent-probe"
+      );
+      expect(observed).toBe(parentName);
+    });
+
     it("throws a clear error when called on a non-facet (top-level agent)", async () => {
       const parentName = uniqueName();
       const parent = await getAgentByName(env.TestSubAgentParent, parentName);
@@ -1170,6 +1256,122 @@ describe("SubAgent", () => {
       expect(err).toMatch(/OuterSubAgent/);
       // And the class the caller (wrongly) passed is named too.
       expect(err).toMatch(/TestSubAgentParent/);
+    });
+
+    it("resolves a facet-only direct parent through the root bridge", async () => {
+      const rootName = uniqueName();
+      const outerName = uniqueName();
+      const innerName = uniqueName();
+      const root = await getAgentByName(env.TestSubAgentParent, rootName);
+
+      const observed = await root.subAgentNestedCallFacetParent(
+        outerName,
+        innerName
+      );
+
+      expect(observed).toBe(`outer:${outerName}`);
+    });
+
+    it("fetches through a facet-parent proxy", async () => {
+      const rootName = uniqueName();
+      const outerName = uniqueName();
+      const innerName = uniqueName();
+      const root = await getAgentByName(env.TestSubAgentParent, rootName);
+
+      const observed = await root.subAgentNestedFetchFacetParent(
+        outerName,
+        innerName,
+        "/parent-path?x=1"
+      );
+
+      expect(observed).toEqual({
+        agentName: outerName,
+        body: "hello from inner",
+        header: "yes",
+        method: "POST",
+        path: "/parent-path",
+        search: "?x=1"
+      });
+    });
+
+    it("fetches through a facet-parent proxy with a Request object", async () => {
+      const rootName = uniqueName();
+      const outerName = uniqueName();
+      const innerName = uniqueName();
+      const root = await getAgentByName(env.TestSubAgentParent, rootName);
+
+      const observed = await root.subAgentNestedFetchFacetParentWithRequest(
+        outerName,
+        innerName,
+        "/request-object?source=request"
+      );
+
+      expect(observed).toEqual({
+        agentName: outerName,
+        body: "hello from request",
+        header: "request",
+        method: "POST",
+        path: "/request-object",
+        search: "?source=request"
+      });
+    });
+
+    it("resolves a deeper facet-only parent through the recursive bridge", async () => {
+      const rootName = uniqueName();
+      const outerName = uniqueName();
+      const innerName = uniqueName();
+      const leafName = uniqueName();
+      const root = await getAgentByName(env.TestSubAgentParent, rootName);
+
+      const observed = await root.subAgentDeepCallFacetParent(
+        outerName,
+        innerName,
+        leafName
+      );
+
+      expect(observed).toBe(`inner:${innerName}`);
+    });
+
+    it("fetches through a deeper facet-parent proxy", async () => {
+      const rootName = uniqueName();
+      const outerName = uniqueName();
+      const innerName = uniqueName();
+      const leafName = uniqueName();
+      const root = await getAgentByName(env.TestSubAgentParent, rootName);
+
+      const observed = await root.subAgentDeepFetchFacetParent(
+        outerName,
+        innerName,
+        leafName,
+        "/deep-parent?mode=recursive"
+      );
+
+      expect(observed).toEqual({
+        agentName: innerName,
+        body: "hello from leaf",
+        header: "yes",
+        method: "POST",
+        path: "/deep-parent",
+        search: "?mode=recursive"
+      });
+    });
+
+    it("throws a clear error for facet-parent WebSocket upgrades", async () => {
+      const rootName = uniqueName();
+      const outerName = uniqueName();
+      const innerName = uniqueName();
+      const leafName = uniqueName();
+      const root = await getAgentByName(env.TestSubAgentParent, rootName);
+
+      const observed = await root.subAgentDeepTryFetchFacetParentWebSocket(
+        outerName,
+        innerName,
+        leafName
+      );
+
+      expect(observed).toMatch(/parentAgent\(InnerSubAgent\)\.fetch\(\)/);
+      expect(observed).toMatch(/WebSocket upgrade requests/i);
+      expect(observed).toMatch(/externally routed sub-agent URLs/i);
     });
   });
 

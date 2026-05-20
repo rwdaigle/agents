@@ -110,7 +110,7 @@ State changes sync to all connected clients automatically. Call methods like the
 Core         State sync · Routing · HTTP & WebSockets · @callable RPC · Sub-agents (facets)
 Clients      React hook · Vanilla JS · Real-time state sync
 Channels     WebSocket · HTTP · Email · (coming: SMS, Voice, Messengers)
-Background   Queue · Scheduling · Workflows · Human-in-the-loop
+Background   Queue · Scheduling · Managed fibers · Workflows · Human-in-the-loop
 AI           Chat agents · Agent tools · Tool calling · MCP servers & clients
 Platform     Observability · Cross-domain auth · Resumable streams
 ```
@@ -380,7 +380,7 @@ Workflows provide:
 - **Long-running tasks** — run for days or weeks
 - **Progress tracking** — report status back to the agent
 
-See [Workflows](./docs/workflows.md) and [Human in the Loop](./docs/human-in-the-loop.md).
+See [Workflows](../../docs/workflows.md) and [Human in the Loop](../../docs/human-in-the-loop.md).
 
 ---
 
@@ -511,12 +511,12 @@ export default {
 
 ## Learn More
 
-[Getting Started](./docs/getting-started.md) ·
-[State Management](./docs/state.md) ·
-[Scheduling](./docs/scheduling.md) ·
-[Callable Methods](./docs/callable-methods.md) ·
-[MCP Integration](./docs/mcp-client.md) ·
-[Full Documentation](./docs/index.md)
+[Getting Started](../../docs/getting-started.md) ·
+[State Management](../../docs/state.md) ·
+[Scheduling](../../docs/scheduling.md) ·
+[Callable Methods](../../docs/callable-methods.md) ·
+[MCP Integration](../../docs/mcp-client.md) ·
+[Full Documentation](../../docs/index.md)
 
 ---
 
