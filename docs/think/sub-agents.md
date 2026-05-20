@@ -23,6 +23,7 @@ async chat(
 
 ```typescript
 interface StreamCallback {
+  onStart?(event: { requestId: string }): void | Promise<void>;
   onEvent(json: string): void | Promise<void>;
   onDone(): void | Promise<void>;
   onError?(error: string): void | Promise<void>;
@@ -31,6 +32,7 @@ interface StreamCallback {
 
 | Method           | When it fires                                                   |
 | ---------------- | --------------------------------------------------------------- |
+| `onStart(event)` | Before work starts; exposes the request id for cancellation     |
 | `onEvent(json)`  | For each streaming chunk (JSON-serialized UIMessageChunk)       |
 | `onDone()`       | After the turn completes and the assistant message is persisted |
 | `onError(error)` | On error during the turn (if not provided, the error is thrown) |
@@ -109,9 +111,39 @@ await child.chat(
 );
 ```
 
-### Aborting a sub-agent turn
+### Cancelling a sub-agent turn
 
-Pass an `AbortSignal` to cancel mid-stream:
+Use `onStart` and `cancelChat()` for RPC-safe cancellation across a
+sub-agent boundary:
+
+```typescript
+let requestId: string | undefined;
+
+const callback: StreamCallback = {
+  onStart(event) {
+    requestId = event.requestId;
+  },
+  onEvent(json) {
+    // Forward stream chunks.
+  },
+  onDone() {},
+  onError(error) {
+    console.error(error);
+  }
+};
+
+const turn = child.chat("Long analysis task", callback);
+
+// Later, from another RPC call or failure handler:
+if (requestId) {
+  await child.cancelChat(requestId, "client disconnected");
+}
+
+await turn;
+```
+
+If the caller and callee are not separated by Workers RPC, you can also pass an
+`AbortSignal` to cancel mid-stream:
 
 ```typescript
 const controller = new AbortController();
@@ -356,10 +388,11 @@ onChatRecovery(ctx: ChatRecoveryContext): ChatRecoveryOptions | void
 
 ### ChatRecoveryOptions
 
-| Field      | Type       | Description                                      |
-| ---------- | ---------- | ------------------------------------------------ |
-| `persist`  | `boolean?` | Whether to persist the partial assistant message |
-| `continue` | `boolean?` | Whether to auto-continue with a new turn         |
+| Field      | Type       | Description                                                                   |
+| ---------- | ---------- | ----------------------------------------------------------------------------- |
+| `persist`  | `boolean?` | Whether to persist the partial assistant message                              |
+| `continue` | `boolean?` | Whether to auto-continue with a new turn via `continueLastTurn()`             |
+| `retry`    | `boolean?` | Whether to retry the interrupted turn against the existing unanswered message |
 
 ### Example
 
@@ -383,7 +416,18 @@ export class MyAgent extends Think<Env> {
 }
 ```
 
-With `persist: true`, the partial message is saved. With `continue: true`, Think calls `continueLastTurn()` after the agent reaches a stable state.
+With `persist: true`, the partial message is saved. With `continue: true`, Think calls `continueLastTurn()` after the agent reaches a stable state. With `retry: true`, Think starts a new response for the latest unanswered user message instead of continuing a partial assistant message. `retry` takes precedence over `continue`.
+
+Use `retry` for pre-stream interruptions, where `ctx.streamId === ""` and `ctx.partialText === ""` but the latest persisted message is an unanswered user message:
+
+```typescript
+onChatRecovery(ctx: ChatRecoveryContext): ChatRecoveryOptions {
+  if (!ctx.streamId && !ctx.partialText) {
+    return { retry: true };
+  }
+  return {};
+}
+```
 
 To suppress continuation for turns that have been orphaned too long to safely replay, gate on `ctx.createdAt`:
 

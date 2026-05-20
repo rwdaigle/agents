@@ -51,6 +51,12 @@ return Response.json({
 
 `submitMessages()` stores pending work first and appends the messages to the conversation `Session` only when the submission starts executing. It accepts serializable `UIMessage[]` values, not the function form supported by `saveMessages((messages) => ...)`.
 
+Use [`startFiber()`](./durable-execution.md#startfiber) outside Think when the
+durable unit is a surrounding application job, such as accepting a webhook once,
+restoring provider state, posting a visible reply, and recording recovery
+policy. `submitMessages()` owns Think's conversation admission; managed fibers
+own external side effects around that turn.
+
 For Think-specific guidance that also compares raw child `chat()` calls with
 agent tools, see [Choosing a turn API](./think/index.md#choosing-a-turn-api).
 
@@ -451,7 +457,7 @@ Pre-aborted signals short-circuit before any model work runs.
 ### Limitations
 
 - **Signals cannot cross Durable Object boundaries.** `AbortSignal` is not an RPC-serializable type. Construct the controller inside the DO that calls `saveMessages`. For Think child-agent orchestration, use [Agent Tools](./agent-tools.md); `runAgentTool()` bridges parent aborts into the child run. For lower-level custom RPC, return a `ReadableStream` from the child and let the parent cancel it — workerd propagates the cancel back to the source's `cancel` callback.
-- **Hibernation drops the listener.** The signal lives in memory. If the DO hibernates mid-turn and `chatRecovery` is enabled, the recovered turn calls `continueLastTurn()` internally without the original signal — an abort fired after restart has no effect on the recovered turn. This is true for top-level agents and sub-agents; sub-agent recovery still works, but the original caller's in-memory signal is gone. Override `onChatRecovery` (Think) or set `chatRecovery = false` for callers that need stronger guarantees.
+- **Hibernation drops the listener.** The signal lives in memory. If the DO hibernates mid-turn and `chatRecovery` is enabled, the recovered turn usually calls `continueLastTurn()` internally without the original signal — an abort fired after restart has no effect on the recovered turn. For pre-stream interruptions, recovery can instead retry the latest unanswered user message when `onChatRecovery` returns `{ retry: true }`. This is true for top-level agents and sub-agents; sub-agent recovery still works, but the original caller's in-memory signal is gone. Override `onChatRecovery` (Think) or set `chatRecovery = false` for callers that need stronger guarantees.
 
 This is the integration point for agent-tool orchestration where the parent's AI SDK abort signal needs to propagate into a child DO's `saveMessages` call. See [`cloudflare/agents#1406`](https://github.com/cloudflare/agents/issues/1406) for the original use case.
 

@@ -1455,6 +1455,10 @@ export class ChatRecoveryTestAgent extends AIChatAgent<Env> {
     return this.continueLastTurn(body);
   }
 
+  async runRecoveryRetryForTest(targetUserId?: string): Promise<void> {
+    await this._chatRecoveryRetry({ targetUserId });
+  }
+
   async saveSyntheticUserMessage(
     text: string
   ): Promise<{ requestId: string; status: string }> {
@@ -1741,9 +1745,9 @@ export class RecoverySlowStreamAgent extends SlowStreamAgent {
 
     type RunFiber = RecoverySlowStreamAgent["runFiber"];
     const originalRunFiber = this.runFiber.bind(this) as RunFiber;
-    (this as unknown as { runFiber: RunFiber }).runFiber = (async () => {
+    (this as unknown as { runFiber: RunFiber }).runFiber = (() => {
       throw new Error("simulated runFiber failure");
-    }) as RunFiber;
+    }) as unknown as RunFiber;
 
     let threw = false;
     try {
